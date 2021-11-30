@@ -24,7 +24,7 @@ for($i = 0; $i < 2; $i++){
             $globalEvent->add($socket, 'read', 'acceptConnection');
             reinstallSignal();
             $globalEvent->loop();
-            fclose($socket);
+
         }
     }else{
         $_idMap[$i]   = $pid;
@@ -35,6 +35,7 @@ for($i = 0; $i < 2; $i++){
 while (1){
     pcntl_signal_dispatch();
     sleep(1);
+    pcntl_signal_dispatch();
 }
 
 function acceptConnection($sock){
@@ -74,13 +75,9 @@ function parseCommand()
                 exit();
             }
             exit();
-        case 'connections':
-            posix_kill($masterPid, SIGIO);
-            sleep(1);
-            exit();
         case 'restart' :
         case 'stop':
-            $masterPid && posix_kill($masterPid, SIGINT);
+            $masterPid && posix_kill($masterPid, SIGHUP);
             if($command == 'stop'){
                 exit();
             }
@@ -135,21 +132,40 @@ function reinstallSignal()
     $globalEvent->add(\SIGIO, 'signal', 'handleSig');
 }
 
+function stopAll(){
+    global $_idMap,$socket,$globalEvent;
+    $masterPid = intval(file_get_contents('./pid.log'));
+    if($masterPid == posix_getpid()){
+        foreach ($_idMap as $v){
+            posix_kill($v, SIGHUP);
+        }
+
+    }else{
+        if($socket){
+            $globalEvent->del($socket,'read');
+            \fclose($socket);
+            $socket = null;
+        }
+
+
+
+    }
+
+}
+
 function handleSig($sig)
 {
     global $_idMap;
     $masterPid = intval(file_get_contents('./pid.log'));
     var_dump('sig....'.$sig);
-    if($masterPid == posix_getpid()){
+
         switch ($sig) {
             // Stop.
+            case \SIGHUP:
             case \SIGINT:
             case \SIGTERM:
                 stopAll();
-                break;
-            case \SIGHUP:
-                stopAll();
-                break;
+                exit();
             // Reload.
             case \SIGQUIT:
             case \SIGUSR1:
@@ -159,8 +175,12 @@ function handleSig($sig)
                 break;
             // Show status.
             case \SIGUSR2:
-                foreach ($_idMap as $v){
-                    posix_kill($v, SIGUSR2);
+                if($masterPid == posix_getpid()){
+                    foreach ($_idMap as $v){
+                        posix_kill($v, SIGUSR2);
+                    }
+                }else{
+                    var_dump(\posix_getpid(),memory_get_usage(true));
                 }
                 break;
             // Show connection status.
@@ -169,8 +189,7 @@ function handleSig($sig)
                 break;
         }
         return;
-    }
-    var_dump(\posix_getpid(),memory_get_usage(true));
+
 
 }
 
@@ -244,6 +263,27 @@ class SelectEvent
         return true;
     }
 
+    public function del($fd, $flag)
+    {
+        $fd_key = (int)$fd;
+        switch ($flag) {
+            case 'read':
+                unset($this->_allEvents[$fd_key][$flag], $this->_readFds[$fd_key]);
+                if (empty($this->_allEvents[$fd_key])) {
+                    unset($this->_allEvents[$fd_key]);
+                }
+                return true;
+            case 'write':
+                unset($this->_allEvents[$fd_key][$flag], $this->_writeFds[$fd_key]);
+                if (empty($this->_allEvents[$fd_key])) {
+                    unset($this->_allEvents[$fd_key]);
+                }
+                return true;
+        }
+        return false;
+    }
+
+
     public function signalHandler($signal)
     {
         var_dump('子进程信号......');
@@ -258,7 +298,10 @@ class SelectEvent
             $write = $this->_writeFds;
             $exp = null;
             if($read || $write){
-                $ret = stream_select($read, $write, $exp, 1, 30);
+                try {
+                    $ret = @stream_select($read, $write, $exp, 0, 1000000);
+                } catch (\Exception $e) {} catch (\Error $e) {}
+
             }else{
                 usleep(3000);
                 $ret = false;
@@ -359,4 +402,3 @@ class TcpConnection
 
     }
 }
-
