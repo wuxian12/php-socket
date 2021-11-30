@@ -1,0 +1,362 @@
+<?php
+$context_option = [];
+$context_option['socket']['backlog'] = 1024;
+$context_option['socket']['so_reuseport'] = 1;
+$_context = \stream_context_create($context_option);
+
+$globalEvent = null;
+
+installSignal();
+parseCommand();
+$masterPid = \posix_getpid();
+file_put_contents('./pid.log',$masterPid);
+
+for($i = 0; $i < 2; $i++){
+    $pid = \pcntl_fork();
+    if($pid == -1){
+        exit();
+    }else if($pid == 0){
+        $socket = stream_socket_server("tcp://0.0.0.0:9800", $errno, $errstr, STREAM_SERVER_BIND | STREAM_SERVER_LISTEN, $_context);
+        if (!$socket) {
+            echo "$errstr ($errno)<br />\n";
+        } else {
+            $globalEvent = new SelectEvent();
+            $globalEvent->add($socket, 'read', 'acceptConnection');
+            reinstallSignal();
+            $globalEvent->loop();
+            fclose($socket);
+        }
+    }else{
+        $_idMap[$i]   = $pid;
+        var_dump($_idMap);
+    }
+}
+
+while (1){
+    pcntl_signal_dispatch();
+    sleep(1);
+}
+
+function acceptConnection($sock){
+    $conn = @stream_socket_accept($sock,1,$remote_address);
+    if (!$conn) {
+        return;
+    }
+    new TcpConnection($conn, $remote_address);
+
+}
+
+function parseCommand()
+{
+    global $argv;
+    $masterPid = intval(file_get_contents('./pid.log'));
+    $able_commands = ['start', 'stop', 'restart', 'reload', 'status', 'connections'];
+    $able_model = ['-d', '-g'];
+    $command = $mode = '';
+    foreach ($argv as $v) {
+        if(in_array($v,$able_commands)){
+            $command = $v;
+        }else if (in_array($v, $able_model)){
+            $mode = $v;
+        }
+    }
+    if(!$command){
+        exit("无效的命令");
+    }
+    switch ($command) {
+        case 'start' :
+            break;
+        case 'status' :var_dump($masterPid);
+            while(1){
+                posix_kill($masterPid, SIGUSR2);
+                sleep(3);
+                var_dump('finish');
+                exit();
+            }
+            exit();
+        case 'connections':
+            posix_kill($masterPid, SIGIO);
+            sleep(1);
+            exit();
+        case 'restart' :
+        case 'stop':
+            $masterPid && posix_kill($masterPid, SIGINT);
+            if($command == 'stop'){
+                exit();
+            }
+            break;
+        case 'reload':
+            posix_kill($masterPid,SIGUSR1);
+    }
+
+}
+
+function installSignal()
+{
+    pcntl_signal(\SIGINT, 'handleSig', false);
+    pcntl_signal(\SIGTERM, 'handleSig', false);
+    pcntl_signal(\SIGHUP, 'handleSig', false);
+    pcntl_signal(\SIGUSR1, 'handleSig', false);
+    pcntl_signal(\SIGQUIT, 'handleSig', false);
+    pcntl_signal(\SIGUSR2, 'handleSig', false);
+    pcntl_signal(\SIGIO, 'handleSig', false);
+    pcntl_signal(\SIGPIPE, 'handleSig', false);
+
+}
+
+function reinstallSignal()
+{
+    global $globalEvent;
+    // uninstall stop signal handler
+    \pcntl_signal(\SIGINT, \SIG_IGN, false);
+    // uninstall stop signal handler
+    \pcntl_signal(\SIGTERM, \SIG_IGN, false);
+    // uninstall graceful stop signal handler
+    \pcntl_signal(\SIGHUP, \SIG_IGN, false);
+    // uninstall reload signal handler
+    \pcntl_signal(\SIGUSR1, \SIG_IGN, false);
+    // uninstall graceful reload signal handler
+    \pcntl_signal(\SIGQUIT, \SIG_IGN, false);
+    // uninstall status signal handler
+    \pcntl_signal(\SIGUSR2, \SIG_IGN, false);
+    // uninstall connections status signal handler
+    \pcntl_signal(\SIGIO, \SIG_IGN, false);
+    // reinstall stop signal handler
+    $globalEvent->add(\SIGINT, 'signal', 'handleSig');
+    // reinstall graceful stop signal handler
+    $globalEvent->add(\SIGHUP, 'signal', 'handleSig');
+    // reinstall reload signal handler
+    $globalEvent->add(\SIGUSR1, 'signal', 'handleSig');
+    // reinstall graceful reload signal handler
+    $globalEvent->add(\SIGQUIT, 'signal', 'handleSig');
+    // reinstall status signal handler
+    $globalEvent->add(\SIGUSR2, 'signal', 'handleSig');
+    // reinstall connection status signal handler
+    $globalEvent->add(\SIGIO, 'signal', 'handleSig');
+}
+
+function handleSig($sig)
+{
+    global $_idMap;
+    $masterPid = intval(file_get_contents('./pid.log'));
+    var_dump('sig....'.$sig);
+    if($masterPid == posix_getpid()){
+        switch ($sig) {
+            // Stop.
+            case \SIGINT:
+            case \SIGTERM:
+                stopAll();
+                break;
+            case \SIGHUP:
+                stopAll();
+                break;
+            // Reload.
+            case \SIGQUIT:
+            case \SIGUSR1:
+//                static::$_gracefulStop = $sig === \SIGQUIT;
+//                static::$_pidsToRestart = static::getAllWorkerPids();
+//                static::reload();
+                break;
+            // Show status.
+            case \SIGUSR2:
+                foreach ($_idMap as $v){
+                    posix_kill($v, SIGUSR2);
+                }
+                break;
+            // Show connection status.
+            case \SIGIO:
+                //static::writeConnectionsStatisticsToStatusFile();
+                break;
+        }
+        return;
+    }
+    var_dump(\posix_getpid(),memory_get_usage(true));
+
+}
+
+class SelectEvent
+{
+    public $_allEvents = [];
+
+    public $_signalEvents = [];
+
+    protected $_readFds = [];
+
+    protected $_writeFds = [];
+
+    protected $_exceptFds = [];
+
+    protected $_scheduler = null;
+
+    public $timerId = 0;
+    protected $_selectTimeout = 1000;
+
+
+    public function __construct()
+    {
+        $this->_scheduler = new \SplPriorityQueue();
+        $this->_scheduler->setExtractFlags(\SplPriorityQueue::EXTR_BOTH);
+    }
+
+    public function add($fd, $flag, $func, $args = [])
+    {
+        switch ($flag) {
+            case 'read':
+            case 'write':
+                $count = $flag === 'read' ? \count($this->_readFds) : \count($this->_writeFds);
+                if($count >= 1024){
+                    echo "varning: system call select execeeded the maximum number of connections 1024\n";
+                }else if(\DIRECTORY_SEPARATOR !== '/' && $count >= 256){
+                    echo "varning: system call select execeeded the maximum number of connections 256\n";
+                }
+                $fd_key = intval($fd);
+                $this->_allEvents[$fd_key][$flag] = [$func, $fd];
+                if($flag == 'read'){
+                    $this->_readFds[$fd_key] = $fd;
+                }else{
+                    $this->_writeFds[$fd_key] = $fd;
+                }
+                break;
+            case 'except':
+                $fd_key = intval($fd);
+                $this->_allEvents[$fd_key][$flag] = [$func, $fd];
+                $this->_exceptFds[$fd_key] = $fd;
+                break;
+            case 'signal':
+                if(\DIRECTORY_SEPARATOR !== '/'){
+                    return false;
+                }
+                $fd_key = intval($fd);
+                $this->_signalEvents[$fd_key][$flag] = [$func, $fd];
+                pcntl_signal($fd,[$this, 'signalHandler']);
+            case 'timer':
+            case 'once':
+                $timer_id = $this->timerId++;
+                $run_time = microtime(true) + $fd;
+                $this->_scheduler->insert($timer_id, -$run_time);
+                $this->_eventTimer[$timer_id] = [$func,$args, $flag, $fd];
+                $select_timeout = ($run_time - microtime(true)) * 1000000;
+                if( $this->_selectTimeout > $select_timeout ){
+                    $this->_selectTimeout = $select_timeout;
+                }
+                return $timer_id;
+        }
+        return true;
+    }
+
+    public function signalHandler($signal)
+    {
+        var_dump('子进程信号......');
+        call_user_func_array($this->_signalEvents[$signal]['signal'][0],[$signal]);
+    }
+
+    public function loop()
+    {
+        while(1){
+            pcntl_signal_dispatch();
+            $read = $this->_readFds;
+            $write = $this->_writeFds;
+            $exp = null;
+            if($read || $write){
+                $ret = stream_select($read, $write, $exp, 1, 30);
+            }else{
+                usleep(3000);
+                $ret = false;
+            }
+            if(!$this->_scheduler->isEmpty()){
+                //$this->tick();
+            }
+            if (!$ret) {
+                continue;
+            }
+            if ($read) {
+                foreach ($read as $fd) {
+                    $fd_key = (int)$fd;
+                    if (isset($this->_allEvents[$fd_key]['read'])) {
+                        \call_user_func_array($this->_allEvents[$fd_key]['read'][0],
+                            array($this->_allEvents[$fd_key]['read'][1]));
+                    }
+                }
+            }
+
+            if ($write) {
+                foreach ($write as $fd) {
+                    $fd_key = (int)$fd;
+                    if (isset($this->_allEvents[$fd_key]['write'])) {
+                        \call_user_func_array($this->_allEvents[$fd_key]['write'][0],
+                            array($this->_allEvents[$fd_key]['write'][1]));
+                    }
+                }
+            }
+        }
+    }
+}
+
+class TcpConnection
+{
+
+    protected $_id = 0;
+
+
+    public $maxSendBufferSize = 1048576;
+
+
+    public static $defaultMaxSendBufferSize = 1048576;
+
+
+    public $maxPackageSize = 1048576;
+
+
+    public static $defaultMaxPackageSize = 10485760;
+
+
+    protected static $_idRecorder = 1;
+
+
+    protected $_socket = null;
+
+    public static $statistics = array(
+        'connection_count' => 0,
+        'total_request'    => 0,
+        'throw_exception'  => 0,
+        'send_fail'        => 0,
+    );
+    public static $connections = [];
+
+
+    public function __construct($socket, $remote_address = '')
+    {
+        global $globalEvent;
+        $this->id = $this->_id = self::$_idRecorder++;
+        ++self::$statistics['connection_count'];
+        $this->_socket = $socket;
+        stream_set_blocking($this->_socket, 0);
+        $globalEvent->add($this->_socket, 'read', array($this, 'baseRead'));
+        $globalEvent->add($this->_socket, 'write', array($this, 'baseWrite'));
+        static::$connections[$this->id] = $this;
+    }
+
+    public function baseRead($socket, $check_eof = true)
+    {
+        while (1){
+            $buf = fread($socket, 1024);
+            if($buf === ''){
+
+            }else{
+                echo 'I have received that : '."\n";
+                \fwrite($this->_socket, str_repeat('Message to send...',1));
+            }
+
+
+        }
+        fclose ($socket);
+    }
+
+    public function baseWrite()
+    {
+        var_dump('nh....');
+        \fwrite($this->_socket, "nhao..\n");
+
+    }
+}
+
